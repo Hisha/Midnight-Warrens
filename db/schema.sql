@@ -1,48 +1,25 @@
+// ==============================
+// FILE: db/schema.sql
+// ==============================
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT UNIQUE NOT NULL,
-  passhash TEXT NOT NULL,
+  salt TEXT NOT NULL,              -- hex
+  passhash TEXT NOT NULL,          -- hex
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS characters (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  name TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
   class TEXT NOT NULL,
   level INTEGER NOT NULL DEFAULT 1,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS zones (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT UNIQUE NOT NULL,
-  kind TEXT NOT NULL CHECK(kind IN ('overworld','dungeon')),
-  seed INTEGER NOT NULL,
-  is_static INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS dungeon_instances (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
-  party_id TEXT,                -- null for solo
-  seed INTEGER NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  expires_at DATETIME
+  UNIQUE(account_id, name)
 );
 
-CREATE TABLE IF NOT EXISTS entity_state (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  instance_id INTEGER REFERENCES dungeon_instances(id) ON DELETE CASCADE,
-  zone_id INTEGER REFERENCES zones(id) ON DELETE CASCADE,
-  entity_guid TEXT NOT NULL,      -- UUID v4
-  kind TEXT NOT NULL,             -- player, npc, prop, loot
-  x REAL NOT NULL,
-  y REAL NOT NULL,
-  z REAL NOT NULL DEFAULT 0,
-  state_json TEXT NOT NULL,
-  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
+-- Simple index for listing
+CREATE INDEX IF NOT EXISTS idx_chars_account ON characters(account_id);
