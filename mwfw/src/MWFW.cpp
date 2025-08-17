@@ -552,7 +552,7 @@ void SecureUDP::receiveLoop() {
 					break;
 				}
 			} else if (recvSize > 0) {
-				handleIncomingPacket(buffer.data(), static_cast<size_t>(recvSize));
+				handleIncomingPacket(buffer.data(), static_cast<size_t>(recvSize), fromAddr);
 			}
 #else
 		socklen_t fromLen = static_cast<socklen_t>(sizeof(fromAddr));
@@ -561,12 +561,12 @@ void SecureUDP::receiveLoop() {
 		if (recvSize < 0)
 			continue;
 		else if (recvSize > 0)
-			handleIncomingPacket(buffer.data(), static_cast<size_t>(recvSize));
+			handleIncomingPacket(buffer.data(), static_cast<size_t>(recvSize), fromAddr);
 #endif
 	}
 }
 
-void SecureUDP::handleIncomingPacket(const uint8_t *buffer, size_t size) {
+void SecureUDP::handleIncomingPacket(const uint8_t *buffer, size_t size, const sockaddr_in& fromAddr) {
 	if (size < HEADER_SIZE)
 		return;
 
@@ -587,13 +587,12 @@ void SecureUDP::handleIncomingPacket(const uint8_t *buffer, size_t size) {
 	{
 		std::lock_guard < std::mutex > lock(m_reassemblyMutex);
 		auto &fragBuf = m_reassemblyMap[msgID];
-		if (fragBuf.fragments.empty()) {
-			fragBuf.fragments.resize(totalFragments);
-			fragBuf.totalFragments = totalFragments;
-			fragBuf.receivedCount = 0;
-			fragBuf.iv = iv;
-			fragBuf.packetType = packetType;
-		}
+    	if (fragBuf.receivedCount == 0) {
+        	char ipbuf[INET_ADDRSTRLEN]{};
+        	inet_ntop(AF_INET, &fromAddr.sin_addr, ipbuf, sizeof(ipbuf));
+        	fragBuf.fromIP = std::string(ipbuf);
+        	fragBuf.fromPort = ntohs(fromAddr.sin_port);
+    	}
 		if (fragBuf.fragments.size() < totalFragments)
 			fragBuf.fragments.resize(totalFragments);
 		if (fragBuf.fragments[fragmentIndex].empty()) {
