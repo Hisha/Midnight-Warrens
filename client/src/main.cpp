@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include "protocol.hpp"
 
 using namespace MWFW;
