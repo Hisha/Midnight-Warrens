@@ -665,6 +665,14 @@ uint32_t SecureUDP::generateMessageID() {
 	return static_cast<uint32_t>(rng());
 }
 
+void SecureUDP::setOnPacket(std::function<void(const std::string&, uint16_t,
+                                               const std::vector<uint8_t>&, bool)> cb) {
+    m_onPacket = std::move(cb);
+}
+void SecureUDP::setSharedKey(const std::string& key) {
+    m_sharedKey = key;
+}
+
 /************************************
  * SQLite3Helper Implementation
  ************************************/
