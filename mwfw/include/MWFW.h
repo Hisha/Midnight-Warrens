@@ -211,3 +211,5 @@ private:
 };
 
 } // namespace MWFW
+
+#endif // MWFW_H
