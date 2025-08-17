@@ -1,6 +1,5 @@
 // ==============================
-// FILE: client/src/main.cpp
-// Console client: logs snapshots and sends periodic moves
+// FILE: client/src/main.cpp (updated)
 // ==============================
 #include "MWFW.h"
 #include <iostream>
@@ -8,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include "protocol.hpp"
 
 using namespace MWFW;
@@ -25,34 +25,62 @@ int main(int argc, char** argv){
 
     std::atomic<bool> running{true};
 
-    udp.setOnPacket([&](const std::string&, uint16_t, const std::vector<uint8_t>& data, bool){
-        std::string s(data.begin(), data.end());
-        auto kv = proto::parseKV(s);
-        if (kv.count("T") && kv["T"] == "snap") {
-            size_t n = kv.count("n") ? static_cast<size_t>(std::stoul(kv["n"])) : 0;
-            std::cout << "SNAP n=" << n;
-            for (size_t i=0;i<n;++i){
-                std::string idk = std::string("id") + std::to_string(i);
-                std::string xk  = std::string("x")  + std::to_string(i);
-                std::string yk  = std::string("y")  + std::to_string(i);
-                if (kv.count(idk) && kv.count(xk) && kv.count(yk))
-                    std::cout << " | id=" << kv[idk] << " x=" << kv[xk] << " y=" << kv[yk];
-            }
-            std::cout << "\n";
-        } else if (kv.count("T") && kv["T"] == "ok") {
-            std::cout << "OK: " << (kv.count("msg")? kv["msg"]:"") << "\n";
-        }
-    });
-
     auto sendKV = [&](const std::vector<std::pair<std::string,std::string>>& items){
         std::string m = proto::kv(items);
         udp.sendPacket(host, port, std::vector<uint8_t>(m.begin(), m.end()), SHARED_KEY, IV, false);
     };
 
-    // login + join
-    sendKV({{"T","login"},{"user","test"},{"pass","test"}});
+    std::vector<int> charIds; std::vector<std::string> charNames;
+
+    udp.setOnPacket([&](const std::string&, uint16_t, const std::vector<uint8_t>& data, bool){
+        std::string s(data.begin(), data.end());
+        auto kv = proto::parseKV(s);
+        if (!kv.count("T")) return;
+        if (kv["T"] == "ok") {
+            std::cout << "OK: " << (kv.count("msg")? kv["msg"]:"") << "\n";
+        } else if (kv["T"] == "err") {
+            std::cout << "ERR: " << (kv.count("msg")? kv["msg"]:"") << "\n";
+        } else if (kv["T"] == "chars") {
+            charIds.clear(); charNames.clear();
+            size_t n = kv.count("n") ? static_cast<size_t>(std::stoul(kv["n"])) : 0;
+            for (size_t i=0;i<n;++i){
+                std::string idk = "id"+std::to_string(i);
+                std::string namek = "name"+std::to_string(i);
+                if (kv.count(idk)) charIds.push_back(std::stoi(kv[idk]));
+                if (kv.count(namek)) charNames.push_back(kv[namek]);
+            }
+            std::cout << "CHAR LIST ("<<n<<"): ";
+            for (size_t i=0;i<charIds.size();++i) std::cout << '['<<charIds[i]<<":"<<(i<charNames.size()?charNames[i]:"?")<<"] ";
+            std::cout << "\n";
+            if (n==0) {
+                sendKV({{"T","create_char"},{"name","Hero"},{"class","warrior"}});
+            } else {
+                sendKV({{"T","select_char"},{"id", std::to_string(charIds[0])}});
+                sendKV({{"T","join"},{"zone","overworld"}});
+            }
+        } else if (kv["T"] == "snap") {
+            size_t n = kv.count("n") ? static_cast<size_t>(std::stoul(kv["n"])) : 0;
+            std::cout << "SNAP n=" << n;
+            for (size_t i=0;i<n;++i){
+                std::string idk = "id"+std::to_string(i);
+                std::string xk = "x"+std::to_string(i);
+                std::string yk = "y"+std::to_string(i);
+                if (kv.count(idk) && kv.count(xk) && kv.count(yk))
+                    std::cout << " | id="<<kv[idk]<<" x="<<kv[xk]<<" y="<<kv[yk];
+            }
+            std::cout << "\n";
+        }
+    });
+
+    // Register (idempotent), then login, then list chars
+    const std::string USER = "test";
+    const std::string PASS = "test";
+
+    sendKV({{"T","register"},{"user",USER},{"pass",PASS}});
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    sendKV({{"T","join"},{"zone","overworld"}});
+    sendKV({{"T","login"},{"user",USER},{"pass",PASS}});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    sendKV({{"T","list_chars"}});
 
     // movement spammer
     std::thread mover([&]{
@@ -75,7 +103,6 @@ int main(int argc, char** argv){
     });
 
     std::cout << "Client running. Ctrl+C to exit." << std::endl;
-    // naive wait loop (no signal handling)
     while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
 
     running.store(false);
