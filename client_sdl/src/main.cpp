@@ -1,4 +1,4 @@
-// FILE: client_sdl/src/main.cpp (drop-in replacement)
+// FILE: client_sdl/src/main.cpp (drop-in)
 #include "MWFW.h"
 #include "protocol.hpp"
 
@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 
 using namespace MWFW;
 using namespace std::chrono;
@@ -44,53 +45,21 @@ static inline SDL_Point worldToScreen(float wx, float wy, const Camera& cam){
   return SDL_Point{ (int)std::lround(sx), (int)std::lround(sy) };
 }
 
-static void fillIsoDiamond(SDL_Renderer* r, int tx, int ty, const Camera& cam, SDL_Color c){
-  SDL_Point p = worldToScreen((float)tx, (float)ty, cam);
-  int hw = (int)std::lround(TILE_W * 0.5f * cam.zoom);
-  int hh = (int)std::lround(TILE_H * 0.5f * cam.zoom);
-  SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-  SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-  // draw horizontal spans from top to middle then middle to bottom
-  for (int y = -hh; y <= hh; ++y){
-    int span = (int)std::lround((1.0 - std::abs((double)y)/hh) * hw);
-    SDL_RenderDrawLine(r, p.x - span, p.y + y, p.x + span, p.y + y);
-  }
-}
-
-static void drawIsoGridLines(SDL_Renderer* r, const Camera& cam, SDL_Color c){
-  SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-  int radius = 16;
-  int cx = (int)std::floor(cam.cx);
-  int cy = (int)std::floor(cam.cy);
-  for (int y = cy - radius; y <= cy + radius; ++y){
-    for (int x = cx - radius; x <= cx + radius; ++x){
-      if (std::abs((x - cx)) + std::abs((y - cy)) <= radius + 4){
-        SDL_Point p = worldToScreen((float)x, (float)y, cam);
-        int hw = (int)std::lround(TILE_W * 0.5f * cam.zoom);
-        int hh = (int)std::lround(TILE_H * 0.5f * cam.zoom);
-        SDL_Point v[5] = {{p.x, p.y-hh},{p.x+hw,p.y},{p.x,p.y+hh},{p.x-hw,p.y},{p.x,p.y-hh}};
-        SDL_RenderDrawLines(r, v, 5);
-      }
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Texture utilities
 #ifdef HAVE_SDL_IMAGE
 static SDL_Texture* loadTextureWithWhiteKey(SDL_Renderer* ren, const std::string& path){
   SDL_Surface* surf = IMG_Load(path.c_str());
   if (!surf){ std::cerr << "IMG_Load failed: " << IMG_GetError() << "\n"; return nullptr; }
-  // Convert to RGBA32 for easy pixel access
   SDL_Surface* rgba = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGBA32, 0);
   SDL_FreeSurface(surf);
   if (!rgba){ std::cerr << "ConvertSurfaceFormat failed\n"; return nullptr; }
-  // Simple near-white alpha key
+  // Near-white to transparent
   Uint32* pix = (Uint32*)rgba->pixels;
   int count = (rgba->pitch / 4) * rgba->h;
   for (int i=0;i<count;++i){
     Uint8 r,g,b,a; SDL_GetRGBA(pix[i], rgba->format, &r,&g,&b,&a);
-    if (r>=245 && g>=245 && b>=245) { a = 0; }
+    if (r>=240 && g>=240 && b>=240) a = 0;
     pix[i] = SDL_MapRGBA(rgba->format, r,g,b,a);
   }
   SDL_Texture* tex = SDL_CreateTextureFromSurface(ren, rgba);
@@ -101,12 +70,18 @@ static SDL_Texture* loadTextureWithWhiteKey(SDL_Renderer* ren, const std::string
 }
 #endif
 
-// ---------------------------------------------------------------------------
 static void sendKV(SecureUDP& udp, const std::string& host, uint16_t port,
                    const std::vector<std::pair<std::string,std::string>>& items){
   std::string m = proto::kv(items);
   std::vector<uint8_t> bytes(m.begin(), m.end());
   udp.sendPacket(host, port, bytes, SHARED_KEY, IV, false);
+}
+
+// Simple deterministic tile choice
+static inline uint32_t hash32(int x, int y){
+  uint32_t h = (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663);
+  h ^= (h >> 13); h *= 0x85ebca6b; h ^= (h >> 16);
+  return h;
 }
 
 int main(int argc, char** argv){
@@ -128,18 +103,24 @@ int main(int argc, char** argv){
 
   Camera cam; cam.screenW = W; cam.screenH = H; cam.zoom = 1.0f;
 
-  // --- Load assets (player strip) -----------------------------------------
+  // --- Load assets ---------------------------------------------------------
 #ifdef HAVE_SDL_IMAGE
-  const std::string ASSET_PLAYER = "assets/player_walk_NE_strip.png"; // put your generated strip here
-  SDL_Texture* playerStrip = loadTextureWithWhiteKey(ren, ASSET_PLAYER);
+  const std::string PLAYER_STRIP = "assets/player_walk_NE_strip.png"; // 768×128 recommended
+  SDL_Texture* playerStrip = loadTextureWithWhiteKey(ren, PLAYER_STRIP);
   int stripW=0, stripH=0; if (playerStrip) SDL_QueryTexture(playerStrip, nullptr, nullptr, &stripW, &stripH);
   const int FRAME_W = 128, FRAME_H = 128;
-  int cols = (stripW>0) ? (stripW / FRAME_W) : 0; if (cols<=0) cols = 1; if (cols>12) cols=12; // safeguard
-  int framesCount = std::min(6, cols); // we’ll just use up to 6 frames
-  std::vector<SDL_Rect> playerSrc;
+  int cols = (stripW>0) ? (stripW / FRAME_W) : 0; cols = std::max(cols, 1);
+  int framesCount = std::min(6, cols);
+  std::vector<SDL_Rect> playerSrc; playerSrc.reserve(framesCount);
   for (int i=0;i<framesCount;++i) playerSrc.push_back(SDL_Rect{ i*FRAME_W, 0, FRAME_W, FRAME_H });
+
+  const std::string TILES_STRIP  = "assets/tiles_basic_strip.png";  // 256×32: grass, dirt, stone, wood
+  SDL_Texture* tilesTex = loadTextureWithWhiteKey(ren, TILES_STRIP);
+  std::vector<SDL_Rect> tileSrc;
+  if (tilesTex){ for (int i=0;i<4;++i) tileSrc.push_back(SDL_Rect{ i*64, 0, 64, 32 }); }
 #else
-  SDL_Texture* playerStrip = nullptr; std::vector<SDL_Rect> playerSrc; int framesCount = 0; const int FRAME_W=128, FRAME_H=128;
+  SDL_Texture* playerStrip = nullptr; std::vector<SDL_Rect> playerSrc; int framesCount=0; const int FRAME_W=128, FRAME_H=128;
+  SDL_Texture* tilesTex = nullptr; std::vector<SDL_Rect> tileSrc;
 #endif
 
   // Networking
@@ -186,9 +167,9 @@ int main(int argc, char** argv){
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   sendKV(udp, host, port, {{"T","list_chars"}});
 
-  // timers
-  auto lastHb = steady_clock::now(); auto lastMove = steady_clock::now(); auto lastAnim = steady_clock::now(); int animIdx = 0;
-  bool keyW=false,keyA=false,keyS=false,keyD=false;
+  // timers & input
+  auto lastHb = steady_clock::now(); auto lastMove = steady_clock::now(); auto lastAnim = steady_clock::now();
+  int animIdx = 0; bool keyW=false,keyA=false,keyS=false,keyD=false; bool moving=false; float lastDX=0,lastDY=0;
 
   while (running.load()){
     // events
@@ -198,7 +179,7 @@ int main(int argc, char** argv){
         if (ev.key.keysym.sym == SDLK_ESCAPE || ev.key.keysym.sym==SDLK_q) running.store(false);
         if (ev.key.keysym.sym == SDLK_w) keyW = true; if (ev.key.keysym.sym == SDLK_a) keyA = true; if (ev.key.keysym.sym == SDLK_s) keyS = true; if (ev.key.keysym.sym == SDLK_d) keyD = true;
         if (ev.key.keysym.sym == SDLK_EQUALS || ev.key.keysym.sym == SDLK_PLUS) cam.zoom = std::min(2.5f, cam.zoom + 0.1f);
-        if (ev.key.keysym.sym == SDLK_MINUS) cam.zoom = std::max(0.5f, cam.zoom - 0.1f);
+        if (ev.key.keysym.sym == SDLK_MINUS) cam.zoom = std::max(0.6f, cam.zoom - 0.1f);
       } else if (ev.type==SDL_KEYUP){
         if (ev.key.keysym.sym == SDLK_w) keyW = false; if (ev.key.keysym.sym == SDLK_a) keyA = false; if (ev.key.keysym.sym == SDLK_s) keyS = false; if (ev.key.keysym.sym == SDLK_d) keyD = false;
       } else if (ev.type==SDL_WINDOWEVENT && ev.window.event==SDL_WINDOWEVENT_SIZE_CHANGED){ cam.screenW=ev.window.data1; cam.screenH=ev.window.data2; }
@@ -206,23 +187,60 @@ int main(int argc, char** argv){
 
     auto now = steady_clock::now();
     if (duration_cast<seconds>(now - lastHb).count() >= 2){ sendKV(udp, host, port, {{"T","hb"}}); lastHb = now; }
+
     if (duration_cast<milliseconds>(now - lastMove).count() >= 66){
-      float dx=0, dy=0; const float STEP=0.25f; if (keyW) dy-=STEP; if (keyS) dy+=STEP; if (keyA) dx-=STEP; if (keyD) dx+=STEP; if (dx||dy){ sendKV(udp, host, port, {{"T","move"},{"dx",std::to_string(dx)},{"dy",std::to_string(dy)}}); } lastMove = now; }
-    if (duration_cast<milliseconds>(now - lastAnim).count() >= 120){ if (framesCount>0){ animIdx = (animIdx + 1) % framesCount; } lastAnim = now; }
+      float dx=0, dy=0; const float STEP=0.25f; if (keyW) dy-=STEP; if (keyS) dy+=STEP; if (keyA) dx-=STEP; if (keyD) dx+=STEP;
+      moving = (dx!=0 || dy!=0);
+      if (moving){ lastDX=dx; lastDY=dy; sendKV(udp, host, port, {{"T","move"},{"dx",std::to_string(dx)},{"dy",std::to_string(dy)}}); }
+      lastMove = now;
+    }
+
+    if (duration_cast<milliseconds>(now - lastAnim).count() >= (moving?120:400)){
+      if (framesCount>0) animIdx = (animIdx + 1) % framesCount; lastAnim = now;
+    }
 
     // render
-    SDL_SetRenderDrawColor(ren, 18, 18, 22, 255); SDL_RenderClear(ren);
+    SDL_SetRenderDrawColor(ren, 22, 22, 26, 255); SDL_RenderClear(ren);
 
-    // filled ground (simple checkerboard of two colors)
-    SDL_Color c1{70,110,70,255}, c2{60,95,60,255};
-    int radius = 14; int cxT=(int)std::floor(cam.cx), cyT=(int)std::floor(cam.cy);
+    // textured ground if available, else plain diamonds
+    int radius = 16; int cxT=(int)std::floor(cam.cx), cyT=(int)std::floor(cam.cy);
     for (int ty=cyT-radius; ty<=cyT+radius; ++ty){
       for (int tx=cxT-radius; tx<=cxT+radius; ++tx){
-        if (std::abs((tx-cxT)) + std::abs((ty-cyT)) <= radius + 2){ SDL_Color cc = ((tx+ty)&1) ? c1 : c2; fillIsoDiamond(ren, tx, ty, cam, cc); }
+        if (std::abs((tx-cxT)) + std::abs((ty-cyT)) <= radius + 2){
+          SDL_Point p = worldToScreen((float)tx, (float)ty, cam);
+          int w = (int)std::lround(TILE_W * cam.zoom); int h = (int)std::lround(TILE_H * cam.zoom);
+          SDL_Rect dst{ p.x - w/2, p.y - h/2, w, h };
+#ifdef HAVE_SDL_IMAGE
+          if (tilesTex && !tileSrc.empty()){
+            uint32_t hsh = hash32(tx,ty); const SDL_Rect& src = tileSrc[hsh % tileSrc.size()];
+            SDL_RenderCopy(ren, tilesTex, &src, &dst);
+          } else
+#endif
+          {
+            // fallback: flat fill diamond
+            SDL_SetRenderDrawColor(ren, 70,110,70,255);
+            for (int dy=-h/2; dy<=h/2; ++dy){
+              float fac = 1.0f - std::abs((float)dy) / (h*0.5f);
+              int span = (int)std::lround(fac * (w*0.5f));
+              SDL_RenderDrawLine(ren, p.x - span, p.y + dy, p.x + span, p.y + dy);
+            }
+          }
+        }
       }
     }
-    // optional grid lines on top
-    drawIsoGridLines(ren, cam, SDL_Color{30,30,36,180});
+
+    // optional grid overlay
+    SDL_SetRenderDrawColor(ren, 30,30,36,180);
+    for (int ty=cyT-radius; ty<=cyT+radius; ++ty){
+      for (int tx=cxT-radius; tx<=cxT+radius; ++tx){
+        if (std::abs((tx-cxT)) + std::abs((ty-cyT)) <= radius + 2){
+          SDL_Point p = worldToScreen((float)tx, (float)ty, cam);
+          int hw = (int)std::lround(TILE_W * 0.5f * cam.zoom); int hh = (int)std::lround(TILE_H * 0.5f * cam.zoom);
+          SDL_Point v[5] = {{p.x, p.y-hh},{p.x+hw,p.y},{p.x,p.y+hh},{p.x-hw,p.y},{p.x,p.y-hh}};
+          SDL_RenderDrawLines(ren, v, 5);
+        }
+      }
+    }
 
     // entities
     std::vector<Entity> entsCopy; { std::lock_guard<std::mutex> lk(world.mx); entsCopy = world.ents; }
@@ -232,13 +250,13 @@ int main(int argc, char** argv){
       if (playerStrip && !playerSrc.empty()){
         SDL_Rect src = playerSrc[animIdx % playerSrc.size()];
         int w = (int)std::lround(src.w * cam.zoom), h = (int)std::lround(src.h * cam.zoom);
-        // anchor feet to tile center: place bottom center at (p.x, p.y)
         SDL_Rect dst{ p.x - w/2, p.y - h + (int)std::lround(8*cam.zoom), w, h };
-        SDL_RenderCopy(ren, playerStrip, &src, &dst);
+        // crude facing from last input: flip horizontally if moving left
+        SDL_RendererFlip flip = (lastDX < 0) ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+        SDL_RenderCopyEx(ren, playerStrip, &src, &dst, 0.0, nullptr, flip);
       } else
 #endif
       {
-        // fallback: colored marker
         int sz = (int)std::lround(10 * cam.zoom); SDL_Rect rect{ p.x - sz/2, p.y - sz, sz, sz };
         if ((int)e.id == myCharId) SDL_SetRenderDrawColor(ren, 200, 240, 80, 255); else SDL_SetRenderDrawColor(ren, 180, 80, 220, 255);
         SDL_RenderFillRect(ren, &rect); SDL_SetRenderDrawColor(ren, 12, 12, 16, 255); SDL_RenderDrawRect(ren, &rect);
