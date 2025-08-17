@@ -9,6 +9,7 @@ option(BUILD_SERVER "Build server" ON)
 
 add_subdirectory(mwfw)
 add_subdirectory(game_common)
+add_subdirectory(client_sdl)
 if (BUILD_SERVER)
   add_subdirectory(server)
 endif()
